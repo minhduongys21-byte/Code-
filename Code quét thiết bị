@@ -1,0 +1,848 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <NimBLEDevice.h>
+#include <string.h>
+
+// =====================================
+// CONFIG
+// =====================================
+
+#define MAX_DEVICES 80
+
+const char* WIFI_NAME = "ESP32-SCANNER";
+const char* WIFI_PASS = "12345678";
+
+WebServer server(80);
+NimBLEScan* scanner = nullptr;
+
+SemaphoreHandle_t mutexData;
+
+volatile bool scanning = false;
+bool scannerReady = false;
+
+struct Device {
+  char name[48];
+  char address[20];
+  int rssi;
+  unsigned long lastSeen;
+};
+
+Device devices[MAX_DEVICES];
+Device apiCopy[MAX_DEVICES];
+
+int deviceCount = 0;
+
+// =====================================
+// CLASSIFICATION
+// =====================================
+
+String classify(String name) {
+  name.trim();
+  name.toLowerCase();
+
+  if (name.length() == 0 || name == "unknown")
+    return "UNKNOWN";
+
+  if (
+    name.indexOf("airpods") >= 0 ||
+    name.indexOf("headphone") >= 0 ||
+    name.indexOf("headset") >= 0 ||
+    name.indexOf("earbuds") >= 0 ||
+    name.indexOf("speaker") >= 0
+  ) return "AUDIO";
+
+  if (
+    name.indexOf("watch") >= 0 ||
+    name.indexOf("band") >= 0 ||
+    name.indexOf("fitbit") >= 0
+  ) return "WATCH";
+
+  if (
+    name.indexOf("iphone") >= 0 ||
+    name.indexOf("ipad") >= 0 ||
+    name.indexOf("apple") >= 0
+  ) return "APPLE";
+
+  if (
+    name.indexOf("samsung") >= 0 ||
+    name.indexOf("galaxy") >= 0
+  ) return "SAMSUNG";
+
+  if (
+    name.indexOf("xiaomi") >= 0 ||
+    name.indexOf("redmi") >= 0 ||
+    name.indexOf("poco") >= 0
+  ) return "XIAOMI";
+
+  if (
+    name.indexOf("oppo") >= 0 ||
+    name.indexOf("realme") >= 0
+  ) return "OPPO";
+
+  if (
+    name.indexOf("vivo") >= 0 ||
+    name.indexOf("iqoo") >= 0
+  ) return "VIVO";
+
+  if (
+    name.indexOf("windows") >= 0 ||
+    name.indexOf("laptop") >= 0 ||
+    name.indexOf("computer") >= 0 ||
+    name.indexOf("macbook") >= 0
+  ) return "COMPUTER";
+
+  return "OTHER";
+}
+
+// =====================================
+// SIGNAL
+// =====================================
+
+String signalLevel(int rssi) {
+  if (rssi >= -50) return "VERY STRONG";
+  if (rssi >= -65) return "STRONG";
+  if (rssi >= -75) return "MEDIUM";
+  if (rssi >= -85) return "WEAK";
+  return "VERY WEAK";
+}
+
+// =====================================
+// JSON ESCAPE
+// =====================================
+
+String escapeJSON(const char* input) {
+  String output;
+  output.reserve(100);
+
+  while (*input) {
+    char c = *input++;
+
+    if (c == '"' || c == '\\') {
+      output += '\\';
+      output += c;
+    }
+    else if (c == '\n') {
+      output += "\\n";
+    }
+    else if (c == '\r') {
+      output += "\\r";
+    }
+    else if ((unsigned char)c >= 32) {
+      output += c;
+    }
+  }
+
+  return output;
+}
+
+// =====================================
+// BLE CALLBACK
+// =====================================
+
+class ScannerCallbacks : public NimBLEScanCallbacks {
+
+  void onResult(
+    const NimBLEAdvertisedDevice* dev
+  ) override {
+
+    if (!mutexData || !dev) return;
+
+    std::string rawAddress =
+      dev->getAddress().toString();
+
+    std::string rawName;
+
+    if (dev->haveName()) {
+      rawName = dev->getName();
+    }
+
+    int index = -1;
+
+    if (
+      xSemaphoreTake(
+        mutexData,
+        pdMS_TO_TICKS(100)
+      ) != pdTRUE
+    ) return;
+
+    // FIND DEVICE
+
+    for (int i = 0; i < deviceCount; i++) {
+      if (
+        strcmp(
+          devices[i].address,
+          rawAddress.c_str()
+        ) == 0
+      ) {
+        index = i;
+        break;
+      }
+    }
+
+    // ADD DEVICE
+
+    if (
+      index == -1 &&
+      deviceCount < MAX_DEVICES
+    ) {
+      index = deviceCount++;
+
+      memset(
+        &devices[index],
+        0,
+        sizeof(Device)
+      );
+
+      snprintf(
+        devices[index].address,
+        sizeof(devices[index].address),
+        "%s",
+        rawAddress.c_str()
+      );
+
+      strcpy(
+        devices[index].name,
+        "Unknown"
+      );
+    }
+
+    // UPDATE DEVICE
+
+    if (index >= 0) {
+
+      if (!rawName.empty()) {
+
+        snprintf(
+          devices[index].name,
+          sizeof(devices[index].name),
+          "%s",
+          rawName.c_str()
+        );
+
+        Serial.print("DEVICE NAME: ");
+        Serial.println(rawName.c_str());
+      }
+
+      devices[index].rssi = dev->getRSSI();
+      devices[index].lastSeen = millis();
+    }
+
+    xSemaphoreGive(mutexData);
+  }
+};
+
+ScannerCallbacks callbacks;
+
+// =====================================
+// START SCAN
+// =====================================
+
+bool startScanner() {
+
+  if (!scannerReady || scanner == nullptr) {
+    return false;
+  }
+
+  if (scanner->isScanning()) {
+    scanning = true;
+    return true;
+  }
+
+  bool result = scanner->start(0, false, true);
+
+  scanning = scanner->isScanning();
+
+  Serial.println(
+    result
+      ? "SCAN STARTED"
+      : "SCAN START FAILED"
+  );
+
+  return result;
+}
+
+// =====================================
+// STOP SCAN
+// =====================================
+
+void stopScanner() {
+
+  if (scanner == nullptr) return;
+
+  if (scanner->isScanning()) {
+    scanner->stop();
+  }
+
+  scanning = false;
+
+  Serial.println("SCAN STOPPED");
+}
+
+// =====================================
+// API
+// =====================================
+
+void apiDevices() {
+
+  int count;
+
+  if (
+    xSemaphoreTake(
+      mutexData,
+      pdMS_TO_TICKS(500)
+    ) != pdTRUE
+  ) {
+    server.send(
+      503,
+      "application/json",
+      "{\"error\":\"BUSY\"}"
+    );
+    return;
+  }
+
+  count = deviceCount;
+
+  memcpy(
+    apiCopy,
+    devices,
+    sizeof(Device) * count
+  );
+
+  xSemaphoreGive(mutexData);
+
+  // SORT BY RSSI
+
+  for (int i = 0; i < count; i++) {
+    for (int j = i + 1; j < count; j++) {
+
+      if (apiCopy[j].rssi > apiCopy[i].rssi) {
+        Device temp = apiCopy[i];
+        apiCopy[i] = apiCopy[j];
+        apiCopy[j] = temp;
+      }
+    }
+  }
+
+  String json;
+  json.reserve(22000);
+
+  json = "{";
+
+  json += "\"count\":";
+  json += String(count);
+
+  json += ",\"scanning\":";
+  json += scanning ? "true" : "false";
+
+  json += ",\"devices\":[";
+
+  for (int i = 0; i < count; i++) {
+
+    if (i) json += ",";
+
+    unsigned long age =
+      (millis() - apiCopy[i].lastSeen) / 1000;
+
+    String name = escapeJSON(apiCopy[i].name);
+    String address = escapeJSON(apiCopy[i].address);
+
+    json += "{";
+
+    json += "\"name\":\"";
+    json += name;
+    json += "\",";
+
+    json += "\"address\":\"";
+    json += address;
+    json += "\",";
+
+    json += "\"category\":\"";
+    json += classify(String(apiCopy[i].name));
+    json += "\",";
+
+    json += "\"rssi\":";
+    json += String(apiCopy[i].rssi);
+    json += ",";
+
+    json += "\"signal\":\"";
+    json += signalLevel(apiCopy[i].rssi);
+    json += "\",";
+
+    json += "\"age\":";
+    json += String(age);
+    json += ",";
+
+    json += "\"online\":";
+    json += age < 12 ? "true" : "false";
+
+    json += "}";
+  }
+
+  json += "]}";
+
+  server.sendHeader("Cache-Control", "no-store");
+
+  server.send(
+    200,
+    "application/json",
+    json
+  );
+}
+
+// =====================================
+// WEB PAGE
+// =====================================
+
+const char webpage[] PROGMEM = R"rawliteral(
+
+<!DOCTYPE html>
+<html lang="vi">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta name="viewport"
+content="width=device-width,initial-scale=1">
+
+<title>ESP32 Scanner V5</title>
+
+<style>
+
+* {
+  box-sizing:border-box;
+}
+
+body {
+  margin:0;
+  padding:16px;
+  background:#0b1220;
+  color:white;
+  font-family:Arial;
+}
+
+header,.box,.device {
+  background:#172338;
+  border-radius:12px;
+  padding:15px;
+}
+
+h2 {
+  color:#38bdf8;
+}
+
+.stats {
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:10px;
+}
+
+.number {
+  font-size:28px;
+  color:#38bdf8;
+  font-weight:bold;
+}
+
+button {
+  padding:14px 20px;
+  border:0;
+  border-radius:9px;
+  margin:5px;
+  color:white;
+  font-weight:bold;
+}
+
+.start {
+  background:#16a34a;
+}
+
+.stop {
+  background:#dc2626;
+}
+
+.device {
+  margin:9px 0;
+  border-left:4px solid #38bdf8;
+  overflow-wrap:anywhere;
+}
+
+.offline {
+  opacity:.45;
+}
+
+.signal {
+  color:#4ade80;
+  font-weight:bold;
+}
+
+.small {
+  font-size:12px;
+  color:#94a3b8;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<header>
+
+<h2>📡 DEVICE SCANNER PRO V5</h2>
+
+<p id="status">BLE đang dừng</p>
+
+</header>
+
+<div class="stats">
+
+<div class="box">
+Tổng thiết bị
+<div class="number" id="total">0</div>
+</div>
+
+<div class="box">
+Đang hoạt động
+<div class="number" id="online">0</div>
+</div>
+
+</div>
+
+<br>
+
+<button class="start" onclick="control('start')">
+▶ START SCAN
+</button>
+
+<button class="stop" onclick="control('stop')">
+■ STOP SCAN
+</button>
+
+<div id="groups"></div>
+
+<script>
+
+const categories = {
+
+SAMSUNG:"📱 SAMSUNG",
+APPLE:"🍎 APPLE",
+XIAOMI:"📱 XIAOMI",
+OPPO:"📱 OPPO",
+VIVO:"📱 VIVO",
+COMPUTER:"💻 COMPUTER",
+AUDIO:"🎧 AUDIO",
+WATCH:"⌚ WATCH",
+OTHER:"📡 OTHER",
+UNKNOWN:"❓ UNKNOWN"
+
+};
+
+let updating = false;
+let busy = false;
+
+async function control(action) {
+
+  if (busy) return;
+
+  busy = true;
+
+  const status =
+    document.getElementById("status");
+
+  status.innerText =
+    action === "start"
+      ? "Đang bắt đầu quét..."
+      : "Đang dừng quét...";
+
+  try {
+
+    const response = await fetch(
+      "/" + action,
+      {
+        cache:"no-store"
+      }
+    );
+
+    const result = await response.text();
+
+    status.innerText = result;
+
+    await update();
+
+  }
+
+  catch(e) {
+
+    status.innerText = "Không kết nối được ESP32";
+
+  }
+
+  finally {
+
+    busy = false;
+
+  }
+}
+
+async function update() {
+
+  if (updating || busy || document.hidden) return;
+
+  updating = true;
+
+  try {
+
+    const response = await fetch(
+      "/api",
+      {
+        cache:"no-store"
+      }
+    );
+
+    if (!response.ok) throw new Error();
+
+    const data = await response.json();
+
+    document.getElementById("total").innerText =
+      data.count;
+
+    document.getElementById("online").innerText =
+      data.devices.filter(d => d.online).length;
+
+    document.getElementById("status").innerText =
+      data.scanning
+        ? "🟢 ĐANG QUÉT BLE"
+        : "🔴 BLE ĐANG DỪNG";
+
+    const groups = {};
+
+    Object.keys(categories).forEach(k => {
+      groups[k] = [];
+    });
+
+    data.devices.forEach(d => {
+
+      if (!groups[d.category]) {
+        groups[d.category] = [];
+      }
+
+      groups[d.category].push(d);
+
+    });
+
+    let html = "";
+
+    Object.keys(categories).forEach(category => {
+
+      const list = groups[category];
+
+      if (!list.length) return;
+
+      html += `
+        <h3>${categories[category]} (${list.length})</h3>
+      `;
+
+      list.forEach((d,index) => {
+
+        html += `
+
+          <div class="device ${d.online ? "" : "offline"}">
+
+            <b>#${index + 1} ${escapeHTML(d.name)}</b>
+
+            <p class="signal">${d.rssi} dBm</p>
+
+            <p>${escapeHTML(d.signal)}</p>
+
+            <p class="small">
+              BLE: ${escapeHTML(d.address)}
+            </p>
+
+            <p class="small">
+              ${d.online ? "Đang phát hiện" : "Mất tín hiệu"}
+            </p>
+
+            <p class="small">
+              Lần cuối: ${d.age} giây trước
+            </p>
+
+          </div>
+
+        `;
+      });
+
+    });
+
+    document.getElementById("groups").innerHTML =
+      html || "Chưa tìm thấy thiết bị BLE";
+
+  }
+
+  catch(e) {
+
+    document.getElementById("status").innerText =
+      "Lỗi kết nối API";
+
+  }
+
+  finally {
+
+    updating = false;
+
+  }
+
+}
+
+function escapeHTML(s) {
+
+  return String(s).replace(/[&<>"']/g, c => ({
+
+    '&':'&amp;',
+    '<':'&lt;',
+    '>':'&gt;',
+    '"':'&quot;',
+    "'":'&#39;'
+
+  })[c]);
+
+}
+
+setInterval(update,2000);
+
+update();
+
+</script>
+
+</body>
+</html>
+
+)rawliteral";
+
+// =====================================
+// WEB SERVER
+// =====================================
+
+void setupWeb() {
+
+  server.on("/", HTTP_GET, []() {
+
+    server.send_P(
+      200,
+      "text/html; charset=utf-8",
+      webpage
+    );
+
+  });
+
+  server.on("/api", HTTP_GET, apiDevices);
+
+  server.on("/start", HTTP_GET, []() {
+
+    bool result = startScanner();
+
+    server.send(
+      result ? 200 : 500,
+      "text/plain",
+      result ? "SCAN STARTED" : "SCAN FAILED"
+    );
+
+  });
+
+  server.on("/stop", HTTP_GET, []() {
+
+    stopScanner();
+
+    server.send(
+      200,
+      "text/plain",
+      "SCAN STOPPED"
+    );
+
+  });
+
+  server.begin();
+}
+
+// =====================================
+// SETUP
+// =====================================
+
+void setup() {
+
+  Serial.begin(115200);
+  delay(500);
+
+  mutexData = xSemaphoreCreateMutex();
+
+  if (!mutexData) {
+    Serial.println("MUTEX ERROR");
+    return;
+  }
+
+  // WIFI
+
+  WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false);
+
+  WiFi.softAP(
+    WIFI_NAME,
+    WIFI_PASS
+  );
+
+  Serial.print("WIFI IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  // BLE INITIALIZATION ONLY
+  // SCANNING IS OFF UNTIL START BUTTON
+
+  NimBLEDevice::init("");
+
+  scanner = NimBLEDevice::getScan();
+
+  if (scanner) {
+
+    scanner->setScanCallbacks(
+      &callbacks,
+      true
+    );
+
+    scanner->setActiveScan(true);
+
+    scanner->setDuplicateFilter(false);
+
+    scanner->setScanResponseTimeout(1000);
+
+    scanner->setInterval(160);
+
+    scanner->setWindow(80);
+
+    scanner->setMaxResults(0);
+
+    scannerReady = true;
+
+    Serial.println("BLE INITIALIZED");
+  }
+  else {
+    Serial.println("BLE SCANNER ERROR");
+  }
+
+  // WEB
+
+  setupWeb();
+
+  Serial.println("SYSTEM READY");
+  Serial.println("BLE WAITING FOR START BUTTON");
+}
+
+// =====================================
+// LOOP
+// =====================================
+
+void loop() {
+
+  server.handleClient();
+
+  scanning = scanner && scanner->isScanning();
+
+  delay(2);
+}
